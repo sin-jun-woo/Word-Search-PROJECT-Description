@@ -1,39 +1,51 @@
 <script>
+  // --- 1. 라이브러리 및 Props 가져오기 ---
+  // 'params'는 svelte-spa-router가 URL 파라미터(예: 게임 ID)를 담아 자동으로 전달하는 prop입니다.
   export let params;
+  // Svelte의 생명주기 함수: onMount는 컴포넌트가 DOM에 추가된 후, onDestroy는 제거되기 전에 실행됩니다.
   import { onMount, onDestroy } from "svelte";
+  // svelte-spa-router 헬퍼: querystring은 URL의 쿼리 문자열을 담는 읽기용 스토어, push는 페이지 이동 함수입니다.
   import { querystring, push } from "svelte-spa-router";
 
-  // --- 상태 변수 (State Variables) ---
-  let gameData = null;
-  let timer = 0;
-  let interval = null;
-  let ws = null;
-  let allSubmissions = []; // 서버에서 받은 모든 결과 기록
-  let isGameFinished = false; // 게임 완료 상태
+  // --- 2. 핵심 상태 변수 ---
+  let gameData = null; // 서버에서 가져온 게임의 모든 정적 데이터(그리드, 단어 등)를 저장합니다.
+  let timer = 0; // 게임 타이머 (초 단위)
+  let interval = null; // 나중에 타이머를 중지시키기 위해 setInterval의 참조를 저장합니다.
+  let ws = null; // 실시간 통신을 위한 WebSocket 객체입니다.
+  let allSubmissions = []; // 이 게임에 대한 모든 플레이어의 결과 제출 기록을 담는 배열입니다.
+  let isGameFinished = false; // 현재 플레이어가 게임을 완료했는지 추적하는 플래그입니다.
 
-  // URL에서 닉네임 가져오기
+  // --- 3. 반응형 상태 (Svelte의 마법) ---
+  // Svelte의 '$:' 문법은 반응형 구문을 만듭니다. 의존하는 변수가 바뀔 때마다 코드가 다시 실행됩니다.
+
+  // $: URL의 쿼리 문자열에서 'nickname'을 추출합니다 (예: ?nickname=Player1).
+  // URL이 변경되면 자동으로 업데이트됩니다.
   $: urlParams = new URLSearchParams($querystring);
   $: nickname = urlParams.get("nickname") || "익명 플레이어";
 
-  // --- 반응형 파생 변수 (Reactive Derived State) ---
-  // gameData가 로드되면 자동으로 파생 변수들이 계산됩니다.
+  // $: 이 변수들은 gameData로부터 '파생'됩니다. gameData가 서버에서 로드되면,
+  // 이 변수들은 자동으로 계산되고 채워집니다.
   $: gridLetters = gameData ? JSON.parse(gameData.grid) : [];
   $: gridSize = gameData ? gameData.grid_size : 10;
   $: wordList = gameData ? JSON.parse(gameData.word_list) : [];
   $: maxWordLen = gameData ? Math.max(...wordList.map((w) => w.length)) : 0;
 
-  // 선택 상태 & 찾은 단어 저장
+  // $: 그리드 셀의 시각적 상태를 관리합니다.
   $: selectedCells = Array(gridSize * gridSize).fill(false);
+  // 'foundWords'는 고유한 단어를 효율적으로 추가하고 확인하기 위해 Set을 사용합니다.
   let foundWords = new Set();
 
-  // allSubmissions이 변경될 때마다 리더보드를 다시 계산합니다.
+  // $: 가장 강력한 반응형 블록입니다. 전체 리더보드는
+  // 'allSubmissions'나 'wordList'가 변경될 때마다 자동으로 다시 계산됩니다.
   $: leaderboard = (() => {
     const totalWords = wordList.length;
+    // 각 플레이어의 *최고* 점수만 효율적으로 저장하기 위해 Map을 사용합니다.
     const playerBestScores = new Map();
+
     for (const submission of allSubmissions) {
       try {
         const playerName = submission.player_name;
-        // 서버에서 받은 found_words는 JSON 문자열이므로 파싱합니다.
+        // 서버는 found_words를 JSON 문자열로 보내므로, 파싱해야 합니다.
         const words = JSON.parse(submission.found_words);
         const score = words.length;
         const time = submission.time_token;
@@ -41,7 +53,10 @@
 
         const currentBest = playerBestScores.get(playerName);
 
-        // 기존 기록이 없거나, 새 기록이 더 좋으면 (점수가 높거나, 점수가 같으면 시간이 짧으면) 업데이트
+        // 플레이어의 최고 점수를 업데이트하는 조건:
+        // 1. 이전 기록이 없거나,
+        // 2. 새 점수가 더 높거나,
+        // 3. 점수는 같지만 시간이 더 빠를 경우.
         if (
           !currentBest ||
           score > currentBest.score ||
@@ -59,36 +74,40 @@
       }
     }
 
-    // Map을 배열로 변환하고 점수(내림차순), 시간(오름차순)으로 정렬
+    // 최고 점수 Map을 배열로 변환하고 정렬합니다.
+    // 1차 정렬: 점수 (내림차순), 2차 정렬: 시간 (오름차순).
     return Array.from(playerBestScores.values()).sort((a, b) => {
       if (b.score !== a.score) return b.score - a.score;
       return a.time - b.time;
     });
   })();
 
-  // --- 생명주기 함수 (Lifecycle Functions) ---
+  // --- 4. 생명주기 함수 ---
   onMount(async () => {
+    // 메인 게임 데이터를 가져옵니다.
     const res = await fetch(`http://127.0.0.1:8000/games/${params.id}`);
     if (res.ok) gameData = await res.json();
 
-    // 기존 게임 결과 불러오기
+    // 초기 리더보드를 채우기 위해 이 게임의 모든 기존 결과를 가져옵니다.
     const resultsRes = await fetch(
       `http://127.0.0.1:8000/games/${params.id}/results`
     );
     if (resultsRes.ok) allSubmissions = await resultsRes.json();
 
+    // 게임 타이머를 시작합니다.
     interval = setInterval(() => {
-      timer++;
+      if (!isGameFinished) timer++;
     }, 1000);
 
-    // WebSocket 연결
+    // 실시간 업데이트를 위해 WebSocket 연결을 설정합니다.
     ws = new WebSocket(`ws://127.0.0.1:8000/ws/games/${params.id}/results`);
     ws.onopen = () => console.log("✅ WebSocket 연결 성공");
     ws.onmessage = (event) => {
       console.log("📥 WebSocket 메시지 수신:", event.data);
       try {
         const newSubmission = JSON.parse(event.data);
-        // 새 결과가 도착하면 allSubmissions 배열에 추가 (leaderboard는 자동으로 업데이트됨)
+        // 새 결과가 도착했습니다! 'allSubmissions'에 추가합니다.
+        // Svelte의 반응성 덕분에 'leaderboard' 계산이 자동으로 실행됩니다.
         allSubmissions = [...allSubmissions, newSubmission];
       } catch (e) {
         console.error("WebSocket 메시지 파싱 오류:", e);
@@ -98,146 +117,116 @@
     ws.onerror = (error) => console.error("❌ WebSocket 오류:", error);
   });
 
+  // onDestroy는 메모리 누수를 방지하는 데 매우 중요합니다.
   onDestroy(() => {
-    if (interval) clearInterval(interval);
-    if (ws) ws.close();
+    if (interval) clearInterval(interval); // 타이머를 멈춥니다.
+    if (ws) ws.close(); // WebSocket 연결을 닫습니다.
   });
 
-  // --- 이벤트 핸들러 및 게임 로직 ---
-  let selectedPath = []; // 클릭한 인덱스
+  // --- 5. 게임 로직 및 이벤트 핸들러 ---
+  let selectedPath = []; // 사용자가 순서대로 클릭한 셀 인덱스의 배열입니다.
 
   function handleCellClick(index) {
-    // 게임이 끝났으면 클릭 무시
-    if (isGameFinished) return;
+    if (isGameFinished || selectedCells[index] === "found") return;
 
-    // 이미 정답으로 처리된 셀은 무시
-    if (selectedCells[index] === "found") return;
+    // 선택 토글: 셀이 이미 경로에 있으면 제거하고, 없으면 추가합니다.
+    selectedPath = selectedPath.includes(index)
+      ? selectedPath.filter((i) => i !== index)
+      : [...selectedPath, index];
 
-    // 같은 셀 다시 클릭하면 선택 취소 (토글)
-    if (selectedPath.includes(index)) {
-      selectedPath = selectedPath.filter((i) => i !== index);
-    } else {
-      selectedPath.push(index);
-    }
-
-    // 선택된 글자 업데이트
     const selectedWord = selectedPath.map((i) => gridLetters[i]).join("");
-    console.log("선택:", selectedWord);
 
-    // 정답일 때
+    // 선택한 단어가 정답인지 확인합니다.
     if (wordList.includes(selectedWord)) {
       alert(`✅ ${selectedWord} 찾았다!`);
       foundWords.add(selectedWord);
-      foundWords = foundWords; // Set의 변경을 Svelte에 알림
+      foundWords = foundWords; // Set의 변경을 Svelte에 알리기 위해 재할당합니다.
 
-      // 서버에 결과 전송
-      sendResultToServer();
+      sendResultToServer(); // 서버에 알립니다 (WebSocket을 통해 다른 플레이어에게도).
 
-      // 선택된 셀을 영구적으로 found 처리
       selectedPath.forEach((i) => (selectedCells[i] = "found"));
+      selectedPath = []; // 경로를 초기화합니다.
 
-      // 선택 상태 초기화
-      selectedPath = [];
-
-      // 게임 완료 여부 확인
       checkGameComplete();
-    } else {
-      // 선택한 글자가 너무 길면 틀린 걸로 간주하고 초기화
-      if (maxWordLen > 0 && selectedWord.length >= maxWordLen) {
-        alert("❌ 틀렸습니다!");
-        resetSelection();
-      }
+    } else if (maxWordLen > 0 && selectedWord.length >= maxWordLen) {
+      // 단어가 틀렸고 가능한 최대 길이에 도달했다면 초기화합니다.
+      alert("❌ 틀렸습니다!");
+      resetSelection();
     }
 
-    // 선택된 셀 표시 (selected or found)를 위해 selectedCells 배열 업데이트
+    // 즉각적인 피드백을 위해 셀의 시각적 상태를 업데이트합니다.
     selectedCells = selectedCells.map((v, i) =>
       selectedPath.includes(i) ? "selected" : v === "found" ? "found" : false
     );
   }
 
-  // 선택 초기화 함수
   function resetSelection() {
     selectedPath = [];
     selectedCells = selectedCells.map((v) => (v === "found" ? "found" : false));
   }
 
-  // 게임 완료 체크 함수
   function checkGameComplete() {
-    // wordList가 존재하고, 찾은 단어 수가 전체 단어 수와 같으면 게임 클리어
     if (wordList.length > 0 && foundWords.size === wordList.length) {
-      if (interval) clearInterval(interval); // 타이머 정지
-      isGameFinished = true; // 게임 완료 상태로 변경
-
-      // UI가 업데이트될 시간을 약간 준 후 알림 표시
+      isGameFinished = true; // 게임 완료 플래그를 설정합니다.
+      // 타이머는 setInterval 콜백 내부에서 멈춥니다.
       setTimeout(() => {
-        alert(
-          `🎉 게임 클리어! 최종 기록: ${timer}초\n\n다른 플레이어들의 현황판도 업데이트됩니다.`
-        );
+        alert(`🎉 게임 클리어! 최종 기록: ${timer}초`);
       }, 100);
     }
   }
 
-  // 서버에 게임 결과를 POST로 전송하는 함수
   async function sendResultToServer() {
     const payload = {
       player_name: nickname,
       time_token: timer,
-      found_words: Array.from(foundWords),
+      found_words: Array.from(foundWords), // JSON으로 보내기 위해 Set을 배열로 변환합니다.
     };
-
     try {
-      const res = await fetch(
-        `http://127.0.0.1:8000/games/${params.id}/results`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        }
-      );
-      if (!res.ok) {
-        console.error("결과 전송 실패:", res.statusText);
-      }
+      await fetch(`http://127.0.0.1:8000/games/${params.id}/results`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
     } catch (error) {
       console.error("결과 전송 중 네트워크 오류:", error);
     }
   }
 
-  // 홈으로 이동하는 함수
+  // --- 6. UI 헬퍼 함수 ---
   function goToHome() {
     push("/");
   }
 
-  // 현재 게임 링크를 복사하는 함수
-  function copyGameLink() {
-    navigator.clipboard
-      .writeText(window.location.href)
-      .then(() => {
-        alert("게임 링크가 클립보드에 복사되었습니다!");
-      })
-      .catch((err) => {
-        console.error("링크 복사 실패:", err);
-      });
+  async function copyGameLink() {
+    try {
+      await navigator.clipboard.writeText(window.location.href);
+      alert("게임 링크가 클립보드에 복사되었습니다!");
+    } catch (err) {
+      console.error("링크 복사 실패:", err);
+    }
   }
 </script>
 
+<!-- 7. HTML 템플릿 -->
 {#if gameData}
+  <!-- 메인 게임 UI는 gameData를 가져온 후에만 렌더링됩니다. -->
   <div class="header">
     <h1>🎮 {gameData.title}</h1>
     <p>{gameData.description}</p>
     <p>
-      ⏳ {Math.floor(timer / 60)}:{timer % 60 < 10
-        ? `0${timer % 60}`
-        : timer % 60}
+      <!-- 타이머 표시, MM:SS 형식으로 포맷팅 -->
+      ⏳ {Math.floor(timer / 60)}:{(timer % 60).toString().padStart(2, "0")}
     </p>
   </div>
 
   <div class="game-container">
-    <!-- 좌측: 단어 리스트 -->
+    <!-- 왼쪽 패널: 단어 목록 -->
     <div class="game-left">
       <h3>📜 찾아야 할 단어</h3>
       <ul>
         {#each wordList as word}
-          <li class={foundWords.has(word) ? "done" : ""}>
+          <!-- 단어를 찾았으면 'done' 클래스를 동적으로 적용합니다. -->
+          <li class:done={foundWords.has(word)}>
             {foundWords.has(word) ? "✅" : "⬜️"}
             {word}
           </li>
@@ -245,29 +234,30 @@
       </ul>
     </div>
 
-    <!-- 중앙: 게임판 -->
+    <!-- 중앙 패널: 게임 그리드 -->
+    <!-- CSS 변수 '--grid-size'를 통해 게임 데이터에 기반한 동적 그리드 레이아웃을 구현합니다. -->
     <div class="game-center" style="--grid-size: {gridSize}">
       {#each gridLetters as letter, i}
         <div
           role="button"
           tabindex="0"
           class="cell
-    {selectedCells[i] === 'found' ? 'found' : ''} 
-    {selectedCells[i] === 'selected' ? 'selected' : ''}"
+            {selectedCells[i] === 'found' ? 'found' : ''} 
+            {selectedCells[i] === 'selected' ? 'selected' : ''}"
           on:click={() => handleCellClick(i)}
           on:keydown={(e) => {
             if (e.key === "Enter" || e.key === " ") {
-              e.preventDefault(); // 스페이스바 누를 때 화면 스크롤 방지
+              e.preventDefault();
               handleCellClick(i);
             }
           }}
         >
-          {gridLetters[i]}
+          {letter}
         </div>
       {/each}
     </div>
 
-    <!-- 우측: 현황판 -->
+    <!-- 오른쪽 패널: 리더보드 -->
     <div class="game-right">
       <h3>🏆 현황판</h3>
       <p class="my-score">
@@ -276,6 +266,7 @@
       </p>
       <hr />
       <ol class="leaderboard">
+        <!-- 'leaderboard' 배열은 반응형이며, 변경 시 이 목록을 다시 렌더링합니다. -->
         {#each leaderboard as player, i}
           <li class:top-rank={i < 3}>
             <span class="rank">
@@ -285,8 +276,10 @@
             <span class="name">{player.name}</span>
             <span class="score">
               {#if player.finished}
+                <!-- 게임을 완료한 플레이어는 최종 시간을 표시합니다. -->
                 <span class="final-time">🏁 {player.time}초</span>
               {:else}
+                <!-- 진행 중인 플레이어는 현재 점수를 표시합니다. -->
                 {player.score}점
               {/if}
             </span>
@@ -296,6 +289,7 @@
     </div>
   </div>
 
+  <!-- 게임 오버 UI: 현재 플레이어가 완료했을 때만 표시됩니다. -->
   {#if isGameFinished}
     <div class="game-over-controls">
       <h3>게임 종료!</h3>
@@ -310,12 +304,15 @@
     </div>
   {/if}
 {:else}
+  <!-- gameData를 사용할 수 있기 전에 표시되는 로딩 메시지 -->
   <p>⏳ 게임 데이터를 불러오는 중...</p>
 {/if}
 
+<!-- 8. 컴포넌트 전용 스타일 -->
 <style>
   .game-container {
     display: grid;
+    /* 반응형 3열 레이아웃 */
     grid-template-columns: 200px 1fr 200px;
     gap: 20px;
     padding: 20px;
@@ -323,6 +320,7 @@
 
   .game-left,
   .game-right {
+    /* 일관된 테마를 위해 App.svelte에 정의된 CSS 변수를 사용합니다. */
     background: var(--card-background);
     padding: 10px;
     border-radius: 10px;
@@ -337,6 +335,7 @@
 
   .game-center {
     display: grid;
+    /* 그리드 열은 템플릿의 '--grid-size' 변수에 의해 동적으로 설정됩니다. */
     grid-template-columns: repeat(var(--grid-size, 10), 40px);
     gap: 5px;
     justify-content: center;
@@ -353,17 +352,18 @@
     cursor: pointer;
     font-weight: bold;
     transition: background 0.2s;
+    user-select: none; /* 빠르게 클릭할 때 텍스트가 선택되는 것을 방지합니다. */
   }
 
   .cell.found {
     background: lightgreen;
-    /* 찾은 단어의 셀은 클릭 비활성화 */
-    pointer-events: none;
+    pointer-events: none; /* 찾은 셀은 클릭할 수 없게 만듭니다. */
   }
   .cell.selected {
     background: yellow;
   }
 
+  /* ... 헤더, 리더보드 등을 위한 기타 스타일 ... */
   .header {
     text-align: center;
     margin-bottom: 20px;
@@ -383,7 +383,7 @@
     display: flex;
     align-items: center;
     padding: 8px 4px;
-    border-bottom: 1px solid #eee;
+    border-bottom: 1px solid var(--card-border);
     transition: background-color 0.2s;
   }
 
